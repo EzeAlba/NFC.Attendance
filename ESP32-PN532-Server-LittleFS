@@ -1,0 +1,403 @@
+//Notas:
+// Conexion de ESP32 a NFCPN532
+//             3v3 <--> vcc
+//             gnd <--> gnd
+//             p21 <--> sda/txd
+//             p22 <--> scl/rxd
+//
+//
+#include "time.h"
+#include <Arduino.h>
+#include "FS.h"
+#include "LittleFS.h"
+#include <LittleFS.h>
+#include <fs.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <PN532_I2C.h>
+#include <PN532.h>
+#include <Preferences.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+
+#define FORMAT_LITTLEFS_IF_FAILED false
+#define LED 2
+#define MAX_STRINGS 1000
+#define DELIMITER ','
+
+// Credenciales WiFi
+const char *ssid = "Albarracin";
+const char *password = "Bel39337905";
+
+PN532_I2C pn532_i2c(Wire);
+PN532 nfc(pn532_i2c);
+Preferences Preferences;
+
+AsyncWebServer server(80); // Servidor web asíncrono
+String logData = "";
+
+void newCard();
+String waitCommand();
+void readCard();
+void verMemo();
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Puerto serie habilitado");
+
+  // Inicializar el sistema de archivos
+  if (!LittleFS.begin(FORMAT_LITTLEFS_IF_FAILED)) {
+    Serial.println("Error al montar LittleFS");
+    return;
+  }
+  Serial.println("LittleFS montado correctamente");
+  
+
+  // Inicia WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Conectado, IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Inicializa preferencias y NFC
+  Preferences.begin("rfid", false);
+  Wire.begin();
+  nfc.begin();
+
+  pinMode(LED, OUTPUT);
+
+  uint32_t versiondata = nfc.getFirmwareVersion();
+  if (!versiondata) {
+    Serial.println("No se encontró el lector NFC");
+    while (1);
+  }
+  Serial.print("Lector NFC encontrado. Versión: ");
+  Serial.println(versiondata, HEX);
+  nfc.SAMConfig();
+  Serial.println("Listo para leer tarjetas RFID");
+
+  // Configuración del servidor web asíncrono
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = "<!DOCTYPE html><html>";
+    html += "<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+    html += "<meta http-equiv=\"refresh\" content=\"5\">";
+    html += "<link rel=\"icon\" href=\"data:,\">";
+    html += "<style>html{font-family: Helvetica; text-align: center;}</style></head>";
+    html += "<body><h1>WebServer con ESP32</h1><h2>Datos de Usuarios:</h2>";
+
+    // Datos de registros
+    html += "<h2>Datos registrados:</h2><p>" + logData + "</p>";
+    html += "</body></html>";
+    request->send(200, "text/html", html);
+  });
+  // Configuración del servidor
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", "<a href=\"/download\">Descargar registros</a>");
+  });
+  
+  // Ruta para descargar el archivo de eventos
+  server.on("/download", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(LittleFS, "/registros.txt", "text/plain");
+  });
+  // Inicia el servidor web asíncrono
+  server.begin();
+}
+
+void loop() {
+  uint8_t uid[] = {0, 0, 0, 0, 0, 0, 0};
+  uint8_t uidLength = 10;
+  
+  String mainCommand = waitCommand();
+
+  if (mainCommand != "") {
+    if (mainCommand == "Ver Menu") {
+      String menuCommand = "";
+
+      do {
+        Serial.println("1. Nueva Tarjeta");
+        Serial.println("2. Ver Memoria");
+        Serial.println("3. Salir");
+        
+        menuCommand = waitInput();
+
+        if (menuCommand == "1") {
+          newCard();
+        } else if (menuCommand == "2") {
+          verMemo();
+        }
+      } while (menuCommand != "3");
+    }
+  } else {
+    readCard();
+  }
+}
+
+
+  String waitInput() //Funcion que nos permite esperar hasta que haya un comando en el puerto serie. 
+  {
+    String input = ""; // Inicializa una cadena vacía para almacenar el comando
+
+    while (true) 
+    { // Ciclo infinito
+      if (Serial.available() > 0) // Verifica si hay datos disponibles para leer
+      { 
+        char c = Serial.read(); // Lee el siguiente caracter del puerto serie
+        if (c == '\n') // Si se presiona Enter, termina la lectura
+        { 
+          break;
+        }
+        input += c; // Agrega el caracter a la cadena del comando
+      }
+    }
+
+    return input; // Devuelve la cadena que contiene el comando
+  }
+
+  String waitCommand() //Funcion que nos permite esperar por dos segundos un comando inngresado por el usuario y devuelve el valor en String. 
+  {
+    String command = "";
+    unsigned long startTime = millis();
+
+   while (millis() - startTime < 1000) // Esperar por un máximo de 2 segundos
+      { 
+        if (Serial.available() > 0) // Verificar si hay datos disponibles para leer
+        { 
+          char c = Serial.read(); // Leer el siguiente caracter
+          if (c == '\n') // Si se presiona Enter, terminar la lectura
+          { 
+            break;
+          }
+          command += c; // Agregar el caracter a la cadena de comando
+        }
+      }   
+   if (command.length() > 0) // Si se leyó algún comando, devolverlo
+        { 
+          return command;
+        } 
+        else  // Si no se leyó ningún comando dentro del tiempo establecido, devolver una cadena vacía
+        {
+          return "";
+        }
+  }
+
+  void newCard() // Funcion que permite agregar una nuevo usuario y con su ID en la memoria del ESP32.
+  {
+    uint8_t uid[] = {0, 0, 0, 0, 0, 0, 0}; 
+    uint8_t uidLength = 10;
+      
+    Serial.println("Ingrese Dato del nuevo usuario:");
+
+    while (!Serial.available()) 
+      {
+            // Esperar hasta que haya datos disponibles en el puerto serie
+      }        
+    String dato = Serial.readStringUntil('\n');
+    Serial.print(dato);
+
+    Serial.println(" Ingrese Tarjeta del nuevo usuario:");
+    uint8_t success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength);
+    Serial.print(success);
+    String uidString;
+    if (success) 
+      {
+          Serial.println("");
+          Serial.println("Tarjeta RFID encontrada!");
+          Serial.print("UID: ");
+          for (uint8_t i = 0; i < uidLength; i++) 
+            {
+              Serial.print(uid[i], HEX);
+            }
+          Serial.println("");
+          uidString = String(uid[0], HEX) + String(uid[1], HEX) + String(uid[2], HEX) + String(uid[3], HEX) + String(uid[4], HEX) + String(uid[5], HEX) + String(uid[6], HEX);
+          Preferences.begin("rfid", false);
+          Preferences.putString(uidString.c_str(), dato );
+          int counter = Preferences.getInt("counter", 0);
+          String str_counter = String(counter);
+          Preferences.putString(str_counter.c_str(),"Tarjeta: " + uidString + ", Dato: " + dato);
+          Preferences.putInt("counter", counter + 1);
+
+          Serial.println("Valor almacenado en la memoria:");
+
+          Serial.println(Preferences.getString(uidString.c_str()));
+          Serial.println(Preferences.getString(str_counter.c_str()));
+          Serial.println("");
+          Preferences.end();
+        }
+
+        // Escribe en el archivo usuarios_nuevo.txt
+        /*File file = fs.open("/usuarios_nuevo.txt", FILE_APPEND);
+        if (!file) 
+        {
+          Serial.println("Error al abrir usuarios_nuevo.txt");
+        } 
+        else 
+        {
+          file.println("UID: " + uidString + ", Usuario: " + dato);
+          file.close();
+          Serial.println("Usuario guardado en usuarios_nuevo.txt");
+        }*/
+         
+  }
+
+  void verMemo() // Funcion que nos permite ver una tarjeta en la memoria interna del ESP32.
+  {
+
+    Serial.println("1.Ver todos los datos guardados.");
+    Serial.println("2.Borrar espacio de memoria.");
+    Serial.println("3.Ver contador");
+    //Serial.println("");
+    //Serial.println("");
+    //Serial.println("");
+    String opcion = waitInput();//Espera por la opcion elegida
+
+    if (opcion == "1")
+    {
+      Preferences.begin("rfid", false); // Inicializa el uso de la memoria flash del ESP32 para almacenar preferencias bajo el nombre "rfid" 
+      int counter = Preferences.getInt("counter", 0);
+      Serial.println("Lista de Usuarios - Tarjetas:");
+      for (int i = 0; i < counter; i++) 
+      {
+        String key = String(i);
+        String value = Preferences.getString(key.c_str(), "empty");    
+        Serial.print("Valor ");
+        Serial.print(i);
+        Serial.print(": ");
+        Serial.println(value);
+      }
+      Serial.println("");
+      Preferences.end();   
+    }
+    else if(opcion == "2")
+    {
+      Serial.println("Ingrese Nombre del Espacio de memoria:");
+      String memoria = waitInput();
+      Preferences.begin(memoria.c_str(),false);
+      Preferences.clear();
+      Serial.printf("Espacio de %s, ha sido eliminado.\n", memoria.c_str());
+      Preferences.end();
+    }
+    else if(opcion == "3")
+    {
+      Serial.print("Contador en: ");
+      Preferences.begin("rfid",false);
+      Serial.println(Preferences.getInt("counter"));
+      Preferences.end();
+    }   
+  }
+
+  void readCard() //Funcion que nos permite leer una tarjeta y mostrar su valor en el puerto serie.
+  {
+     uint8_t uid[] = {0, 0, 0, 0, 0, 0, 0}; 
+     uint8_t uidLength = 10;
+     uint8_t lectura = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength);
+     bool accessGranted = false;
+
+     if (lectura) 
+     {
+       // Obtener la hora del evento
+       String hora = getTime();
+
+       Serial.println("");
+       Serial.print("Tarjeta RFID Leida -");
+ 
+       Serial.println(hora);
+       Serial.print("UID: ");
+       for (uint8_t i = 0; i < uidLength; i++) 
+       {
+         Serial.print(uid[i], HEX);
+       }
+       Serial.println("");
+        // Verificar si el UID de la tarjeta está almacenado en la memoria
+       Preferences.begin("rfid", false);
+       String dato;
+       String uidString = String(uid[0], HEX) + String(uid[1], HEX) + String(uid[2], HEX) + String(uid[3], HEX) + String(uid[4], HEX) + String(uid[5], HEX) + String(uid[6], HEX);
+       if (Preferences.getString(uidString.c_str()) != "") // se podria usar algo como isKey(uidString.c_str)
+        {    
+         dato = Preferences.getString(uidString.c_str());
+         accessGranted = true;
+        }
+        Preferences.end();
+
+
+
+        // Escribir en registros.txt
+        logEvent(uidString, dato, hora, accessGranted);
+       /* File file = fs.open("/registros_nuevo.txt", FILE_APPEND);
+        if (!file) 
+        {
+          Serial.println("Error al abrir registros_nuevo.txt");
+        } 
+        else 
+        {
+          file.println("Usuario: " + dato + " , UID: " + uidString + "//");//+ ", Hora: " + hora
+          file.close();
+          Serial.println("Registro guardado en registros_nuevo.txt");
+        }*/
+
+        // Mostrar acceso en el puerto serie
+        if(accessGranted)
+        {
+         Serial.print(dato); 
+         Serial.println(": Acceso Permitido");
+         logData += "Usuario: " + dato +  " | Tarjeta UID: " + uidString + " | Hora: " + hora + " | Acceso Permitido<br>";
+         Serial.println("");
+         digitalWrite(LED, HIGH);
+         delay(1000);
+         digitalWrite(LED, LOW);         
+        }
+        else
+        {
+          Serial.println("Acceso Denegado");
+          Serial.println("");
+          logData += "Tarjeta UID: " + uidString + " | Hora: " + hora + " | Acceso Denegado<br>";
+          digitalWrite(LED, LOW);
+        } 
+
+      }
+  }
+
+  String getTime()//Funcion que nos permite obtener el tiempo. 
+  {
+    String hora = "";
+    // Init and get the time
+    configTime(-10800, 0, "pool.ntp.org");
+    struct tm timeinfo;
+    if(!getLocalTime(&timeinfo))
+    {
+      Serial.println("Failed to obtain time");
+      return "Failed to obtain time";
+    }
+    char buffer[64]; // Un buffer para almacenar la hora formateada
+    strftime(buffer, sizeof(buffer), "%a, %d %b %Y %H:%M", &timeinfo);
+    hora = String(buffer); // Convertir el buffer a String
+
+    return hora; // Devolver la hora como String
+  }
+
+  void logEvent(String uid, String dato, String hora, bool accessGranted)//Funcion que almacena eventos en un archivo .txt
+  {
+    // Abrir el archivo en modo append para agregar nuevos eventos
+    File file = LittleFS.open("/registros.txt", FILE_APPEND);
+    if (!file) {
+      Serial.println("Error al abrir el archivo de eventos");
+      return;
+    }
+    
+    String logEntry = "UID: " + uid + " | Usuario: " + dato + " | Hora: " + hora + " | Acceso: ";
+    logEntry += (accessGranted ? "Permitido" : "Denegado");
+    logEntry += "\n";
+  
+    file.print(logEntry);
+    file.close();
+    
+    Serial.println("Evento registrado: " + logEntry);
+  }  
+
+
+
+  
